@@ -13,7 +13,7 @@ The solution was developed for a competitive hackathon setting and includes:
 - Ensemble optimization
 - Leaderboard-aware experimentation
 
-The final solution achieved a Public Leaderboard Score of 91.16918.
+The final solution achieved a Public Leaderboard Score of 91.45390.
 
 ---
 
@@ -161,46 +161,70 @@ were removed and replaced with:
 
 # Target Encoding
 
-Leakage-safe OOF target encoding was implemented for:
+Leakage-safe Out-of-Fold (OOF) target encoding was implemented for:
 
 - geohash
 - hour
 - RoadType
 - day
 
-This significantly improved generalization.
+The encodings are computed **inside each cross-validation fold** using only that
+fold's training rows, then mapped onto the validation and test rows. Unseen
+categories fall back to the global mean. Computing the encoding in-fold (rather than
+once on the full training set) guarantees that no target information leaks from
+validation into training, which significantly improved generalization.
 
 ---
 
 # Models Used
 
+The final solution trains three GPU-accelerated gradient boosting regressors inside a
+shared 5-fold cross-validation loop. Each model uses **early stopping (200 rounds)**
+so it selects its own optimal number of trees, and all models are trained on a
+**log1p-transformed target** (predictions inverted with `expm1` and clipped at zero,
+since demand is non-negative and right-skewed).
+
 ## CatBoost
-- Excellent categorical handling
+- Native categorical handling via `cat_features` (its core strength on high-cardinality fields like geohash)
+- 5000 iterations, learning rate 0.03, depth 8, l2_leaf_reg 3
 - GPU accelerated
 
 ## XGBoost
-- Strong nonlinear structured learning
-- Best-performing individual model
+- Strongest individual model on this data
+- 5000 trees, learning rate 0.02, max_depth 8, subsample 0.8, colsample_bytree 0.8, min_child_weight 3, reg_lambda 1
+- `hist` tree method on CUDA
 
 ## LightGBM
-- Efficient leaf-wise boosting
-- Strong ensemble diversity
+- Native categorical handling via `categorical_feature`; adds ensemble diversity
+- 5000 trees, learning rate 0.02, num_leaves 63, subsample 0.8 (subsample_freq 1), colsample_bytree 0.8, reg_lambda 1, min_child_samples 20
+
+Out-of-fold (OOF) predictions are stored for every model so the ensemble can be
+**measured directly rather than guessed**.
 
 ---
 
 # Ensemble Learning
 
-Final weighted ensemble:
+Instead of hand-set blend weights, the ensemble weights are **optimised on the
+out-of-fold predictions** using SLSQP (weights constrained to be non-negative and to
+sum to 1) to maximise OOF R². The optimised weights are used only if they beat a
+simple average on OOF, which guards against overfitting the blend. Final test
+predictions are clipped at zero.
 
 ```python
-final_preds = (
+from scipy.optimize import minimize
 
-    0.05 * cat_preds +
+def neg_r2(w):
+    return -r2_score(y, oof_stack.dot(w))
 
-    0.70 * xgb_preds +
-
-    0.25 * lgb_preds
+res = minimize(
+    neg_r2,
+    x0=[1/3, 1/3, 1/3],
+    method='SLSQP',
+    bounds=[(0, 1)] * 3,
+    constraints={'type': 'eq', 'fun': lambda w: w.sum() - 1},
 )
+weights = res.x   # used only if it beats the simple average on OOF
 ```
 
 ---
@@ -211,22 +235,31 @@ final_preds = (
 |---|---|
 | Initial CatBoost | 85.72 |
 | Leakage-safe OOF Model | 86.66 |
-| Final Weighted Ensemble | 91.16918 |
+| Fixed-weight Ensemble | 91.16918 |
+| Optimised Ensemble (best) | 91.45390 |
 
 ---
 
 # Advanced Experiments
 
-Several advanced experiments were explored:
+Several advanced experiments were explored on top of the optimised ensemble.
 
-## Attempted Improvements
+## Improvements that worked
 
-- Stacking Ensemble
-- Rank Averaging
-- Log-Transform Target
-- Bayesian Smoothed Target Encoding
-- High-Cardinality Interaction TE
-- XGB Hyperparameter Tuning
+- Native categorical handling (CatBoost / LightGBM)
+- Log-transform of the target
+- Per-model early stopping
+- OOF-optimised ensemble weights (SLSQP)
+
+## Experiments that did NOT help
+
+- Temporal lag / rolling / history features
+- High-cardinality interaction target encoding (geohash x hour, geohash x day-of-week)
+- Spatial cluster features
+
+These raised local CV but reduced the leaderboard score (a temporal/interaction-heavy
+variant scored 90.49 versus the best 91.45), confirming the feature set had limited
+room for added complexity.
 
 ## Key Learning
 
@@ -245,15 +278,15 @@ instead of:
 
 # Final Insights
 
-The biggest improvement came from:
+The biggest improvements came from:
 
-- fixing target leakage
-- proper validation strategy
-- calibrated ensemble learning
+- fixing target leakage (in-fold OOF target encoding)
+- native categorical handling and a log-transformed target
+- calibrated, OOF-optimised ensemble weighting
 
 NOT from:
 - deeper models
-- excessive feature interactions
+- excessive feature interactions or temporal/history features
 - complicated stacking
 
 ---
@@ -264,6 +297,7 @@ NOT from:
 - Pandas
 - NumPy
 - Scikit-Learn
+- SciPy
 - CatBoost
 - XGBoost
 - LightGBM
@@ -281,10 +315,10 @@ Traffic-Demand-Prediction/
 │   ├── test.csv
 │
 ├── notebooks/
-│   ├── EDA.ipynb
-│   ├── Missing_Value_Imputation.ipynb
-│   ├── Feature_Engineering.ipynb
-│   ├── Model_Training.ipynb
+│   ├── EDA_for_Traffic_Prediction.ipynb
+│   ├── Data_Preprocessing_Traffic_Prediction.ipynb
+│   ├── Feature_Engineering_Traffic_Prediction.ipynb
+│   ├── Final_Submission_Flipkart_Gridlock_Optimised.ipynb
 │
 ├── submissions/
 │   ├── submission_v1.csv
@@ -301,10 +335,11 @@ Traffic-Demand-Prediction/
 
 Potential future work:
 
+- Optuna hyperparameter tuning
+- Increased folds + multi-seed averaging
+- Smoothed (Bayesian) target encoding
+- Additional diverse base learners (e.g. HistGradientBoosting)
 - Adversarial Validation
-- Pseudo Labeling
-- Better temporal validation
-- Smoothed Bayesian encoding
 - Graph-based traffic modeling
 - Deep learning for spatio-temporal forecasting
 
@@ -312,7 +347,7 @@ Potential future work:
 
 # Final Leaderboard Score
 
-Public Score: 91.16918
+Public Score: 91.45390
 
 ---
 
